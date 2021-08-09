@@ -1,0 +1,291 @@
+---
+title: "Serial Interval Virus Watch"
+output: html_document
+---
+
+# Parameters
+
+```{r parameters}
+#not set in YAML params due to issues with DSH
+#max serial interval allowed (days):
+max_si = 23
+
+#OTHERS
+#Age corr test method:
+cormethod = "spearman"
+
+#linetype plot:
+linestyle = "dotdash"
+
+#colours:
+.blue_pink <- c("#971A82", "#5480E7")
+
+```
+
+# Set-up
+
+```{r setup, include = FALSE}
+
+packages <- c("tidyverse","lubridate", "scales", "magrittr", "knitr", "kableExtra", "patchwork", "gridExtra", "DescTools")
+#library(flextable)
+#library(car)
+
+for (p in packages) {
+  if(!require(p, character.only = TRUE)) install.packages(p)
+  library(p, character.only = TRUE)
+  
+}
+
+
+
+knitr::opts_chunk$set(comment = NA, warning = FALSE, message = FALSE, echo = FALSE, dpi=300, fig.width = 9, fig.align = 'center')
+
+
+```
+
+# Data Cleaning
+
+```{r clean illness data}
+
+#load
+df <- read_csv("data access requests can be made to the Virus Watch chief investigators (ACHor RWA) at viruswatch@ucl.ac.uk") # illness_episodes
+.total_householders<- read_csv("data access requests can be made to the Virus Watch chief investigators (ACHor RWA) at viruswatch@ucl.ac.uk") %>% select(household_id, no_of_householders) #number of householders
+
+
+#parse date
+df$start_dt2<- as.Date(df$start_dt, format="%d%b%Y")
+df$end_dt2<- as.Date(df$end_dt, format="%d%b%Y")
+
+df %<>%
+  select(illnessid,newID, household_id,start_dt2, 
+         end_dt2, swabbed, swaboutcome,nVar1_bin, nVar2_bin, 
+         region, sex_bin, hh_age_on_entry, age3)
+
+df$illnessid<- as.character(df$illnessid)
+df$newID<- as.character(df$newID)
+df$household_id<- as.character(df$household_id)
+df$swabbed<- as.character(df$swabbed)
+df$swaboutcome<- as.character(df$swaboutcome)
+df$nVar1_bin<- as.character(df$nVar1_bin)
+df$nVar2_bin<- as.character(df$nVar2_bin)
+df %<>% arrange(start_dt2)
+
+```
+
+```{r case encoding}
+
+df_time <- df %>%  
+  filter(swaboutcome=="positive") %>% 
+  distinct() %>% 
+  group_by(household_id) %>% 
+  arrange(start_dt2, .by_group=TRUE) %>% 
+  mutate(diff_days= difftime(start_dt2, lag(start_dt2), units = "days"),
+         diff_days2 = ifelse(newID==lag(newID), NA, diff_days),
+         case_type = ifelse(row_number()==1, "index_case", "secondary_case")) %>% 
+  as.data.frame()
+
+```
+
+# Transmission pairs
+
+## Possible transmissions
+
+```{r transmission pairs function, include=FALSE}
+possible_transmissions <- data.frame()
+for(hid in unique(df_time$household_id)){
+  temp_hh <- subset(df_time, household_id == hid)  # isolate household
+  secondary_cases <- subset(temp_hh, case_type == "secondary_case") # extract secondary cases
+  
+  if(nrow(secondary_cases) > 0){
+    for(i in 1:nrow(secondary_cases)){
+      temp_sc <- secondary_cases[i,]  # get individual  i
+      print(paste("Current ID: ", temp_sc$newID, sep=""))
+      not_temp_sc <- subset(temp_hh, newID != temp_sc$newID) # get everyone else in the household for comparison
+      temp_sc_start_date <- temp_sc$start_dt2 # get their start dates
+      
+      if(nrow(not_temp_sc) > 0){
+        for(j in 1:nrow(not_temp_sc)){
+          temp_not_sc <- not_temp_sc[j,] # get individual j
+          print(paste("     Now Comparing against",temp_not_sc$newID, sep = ":"))
+          temp_not_sc_start <- temp_not_sc$start_dt2   # get start date of  individual j
+          temp_not_sc_max_si <- temp_not_sc_start + max_si   # generate its upper-bound
+          
+          if(!is.na(temp_not_sc_start) & !is.na(temp_sc_start_date) & !is.na(temp_not_sc_max_si)){
+            if(temp_not_sc_start <= temp_sc_start_date & temp_sc_start_date <= temp_not_sc_max_si){
+              print(paste("          Found possible infector",temp_not_sc$newID,sep=":"))
+              link_df <- data.frame(temp_sc$newID, temp_sc$start_dt2, temp_not_sc$newID, temp_not_sc$start_dt2)
+              possible_transmissions <- rbind(possible_transmissions, link_df) # if individual j is within max_si days of individual i -> keep
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+rm(link_df, not_temp_sc, temp_hh, temp_sc, temp_not_sc, temp_not_sc_max_si,temp_not_sc_start,temp_sc_start_date,i,j,hid ,secondary_cases)
+
+
+```
+
+```{r clean possible transmission}
+
+possible_transmissions <- possible_transmissions %>% rename(infectee_ID = temp_sc.newID,
+                              infectee_start_date = temp_sc.start_dt2,
+                              infector_ID = temp_not_sc.newID,
+                              infector_start_date = temp_not_sc.start_dt2)
+
+
+info<-df_time %>% mutate(adult = ifelse(hh_age_on_entry>=16, "adult", "child")) %>% 
+  select(newID, start_dt2, nVar2_bin,case_type, sex_bin, adult, age3, hh_age_on_entry, region ) %>% 
+  rename(sex = sex_bin) %>% distinct()
+
+#merge infector info
+temp_infector <- merge(possible_transmissions, info, by.x=c("infector_ID", "infector_start_date"), by.y = c("newID", "start_dt2") ) %>%  rename(nVar2_infector = nVar2_bin,
+                                      infector_type = case_type,
+                                      infector_age = hh_age_on_entry,
+                                      infector_ageG = age3,
+                                      infector_adult = adult,
+                                      infector_sex = sex)
+
+#merge infectee info
+temp_infectee <- merge(possible_transmissions, info, by.x=c("infectee_ID", "infectee_start_date"), by.y = c("newID", "start_dt2") ) %>% select(-nVar2_bin, -case_type, -region) %>% 
+  rename(infectee_age = hh_age_on_entry,
+         infectee_ageG = age3,
+         infectee_adult = adult,
+         infectee_sex = sex)
+
+
+possible_transmissions <- merge(temp_infector, temp_infectee, by = intersect(colnames(temp_infector), colnames(temp_infectee))) %>% 
+  mutate(household_id = substr(infector_ID, 1, nchar(infector_ID)-1)) %>% 
+  group_by(household_id) %>% 
+  arrange(infector_start_date, infectee_start_date)
+
+rm(temp_infector, temp_infectee, info)
+
+```
+
+## Certain transmissions
+
+```{r certain transmissions, include = FALSE}
+.dup<-possible_transmissions %>% filter(duplicated(infectee_ID)) %>% select(infectee_ID) %>% distinct()
+certain_transmissions <- possible_transmissions %>% filter(!(infectee_ID %in% .dup$infectee_ID))
+certain_transmissions$serial_interval <- difftime(certain_transmissions$infectee_start_date, certain_transmissions$infector_start_date, units = c("days"))
+certain_transmissions$serial_interval<-as.numeric(certain_transmissions$serial_interval)
+certain_transmissions$nVar2_infector<-factor(certain_transmissions$nVar2_infector, levels = c("Hotspot","Non-hotspot") )
+
+
+```
+
+```{r add total householders}
+certain_transmissions<- merge(certain_transmissions, .total_householders, by = "household_id", all.x = TRUE)
+
+```
+
+### Household Outbreak
+
+```{r household outbreak duration}
+housebreak<-certain_transmissions %>% group_by(household_id) %>% arrange(infector_start_date, .by_group = TRUE) %>% summarise(diff = max(infectee_start_date) - min(infector_start_date))
+table(housebreak$diff)
+quantile(housebreak$diff, probs = c(0.97))
+housebreak %>% ggplot()+aes(x = diff)+ geom_bar()
+
+```
+
+# Overall distribution
+
+```{r overall distrib}
+
+certain_transmissions %>% 
+  ggplot(aes(x=serial_interval,fill=TRUE)) +
+  geom_density(alpha=.8)+
+  geom_vline(aes(xintercept = mean(serial_interval, color = "mean")),linetype = linestyle, size=1, show.legend = TRUE)+
+  scale_fill_manual(values = "#971A82")+
+  scale_color_manual(values = "#971A82", name = "mmean")+
+  theme_minimal()+
+  scale_x_continuous(breaks = seq(0,20, by = 2))+
+  labs(x = "serial interval [days]")+
+  guides(fill = FALSE)
+
+
+density(certain_transmissions$serial_interval)
+maxdens<-which.max(density(certain_transmissions$serial_interval)$y)
+density(certain_transmissions$serial_interval)$x[maxdens]
+qts<-quantile(certain_transmissions$serial_interval, probs = c(0.,0.95))
+qts
+hist(certain_transmissions$serial_interval)
+
+
+
+# 95ci
+mean(certain_transmissions$serial_interval)
+m1<-lm(serial_interval~1, certain_transmissions)
+confint(m1, level = 0.95)
+```
+
+# Variants
+
+```{r variant distribution}
+
+.nvartab<- certain_transmissions %>% 
+  drop_na(nVar2_infector) %>% 
+  group_by(nVar2_infector) %>% 
+  dplyr::summarise( mean = round(mean(serial_interval), digits = 2),
+                    median = round(median(serial_interval), digits = 2),
+                    n = n())
+.nvartab
+
+.t_var2<-certain_transmissions %>% 
+  select(nVar2_infector, serial_interval) %>% 
+  drop_na(nVar2_infector) 
+
+
+certain_transmissions %>% 
+  drop_na(nVar2_infector) %>% 
+  mutate( nVar2_infector = as.character(nVar2_infector)) %>% 
+  ggplot(aes(x=serial_interval,fill=nVar2_infector)) +
+  geom_density(alpha=.4, aes(color = nVar2_infector))+
+  geom_vline(data=.nvartab, aes(xintercept = mean, colour= as.character(nVar2_infector)), linetype = linestyle, size=1)+
+  theme_minimal()+
+  scale_fill_manual(breaks = c("Hotspot", "Non-hotspot"), values = .blue_pink)+ 
+  scale_x_continuous(breaks = seq(0,20, by = 2))+
+  scale_colour_manual(breaks = c("Hotspot", "Non-hotspot"),
+                      values = .blue_pink)+
+  labs(fill = "VOC status (Mean)",
+       x = "serial interval [days]",
+       color = "VOC status (Mean)")
+
+
+```
+
+```{r stats}
+var_test <- t.test(serial_interval ~ nVar2_infector, data = .t_var2)
+var_test
+
+#voc
+voc <- certain_transmissions %>% filter(nVar2_infector=="Hotspot")
+mvoc<-lm(serial_interval~1, voc)
+confint(mvoc, level = 0.95)
+
+#nonvoc
+novoc<-certain_transmissions %>% filter(nVar2_infector=="Non-hotspot") 
+mnovoc<-lm(serial_interval~1, novoc)
+confint(mnovoc, level = 0.95)
+
+IDs<-c(certain_transmissions$infector_ID, certain_transmissions$infectee_ID)
+IDs<-c(possible_transmissions$infector_ID, possible_transmissions$infectee_ID)
+length(unique(IDs))
+
+length(unique(certain_transmissions$household_id))
+
+table(certain_transmissions$nVar2_infector)
+mean(certain_transmissions$serial_interval)
+median(certain_transmissions$serial_interval)
+
+m1<-lm(serial_interval~1, certain_transmissions)
+confint(m1, level = 0.95)
+
+
+DescTools::MedianCI(certain_transmissions$serial_interval, conf.level = 0.95)
+
+```
